@@ -660,7 +660,8 @@ async fn conversation_start_defaults_to_v2_and_gpt_realtime_1_5() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conversation_start_can_use_realtime_provider_without_switching_task_provider() -> Result<()> {
+async fn conversation_start_can_use_realtime_provider_without_switching_task_provider() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
 
     let api_server = start_mock_server().await;
@@ -779,7 +780,10 @@ async fn conversation_webrtc_uses_realtime_provider_auth_without_switching_task_
         });
     let test = builder.build(&api_server).await?;
 
-    assert_eq!(test.codex.config_snapshot().await.model_provider.name, "azure-task");
+    assert_eq!(
+        test.codex.config_snapshot().await.model_provider.name,
+        "azure-task"
+    );
 
     test.codex
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
