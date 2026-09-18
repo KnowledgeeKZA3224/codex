@@ -603,6 +603,9 @@ pub use codex_protocol::protocol::RealtimeVoice;
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct RealtimeConfig {
+    /// Optional provider used only by realtime/voice transport. When unset,
+    /// realtime keeps the task's model provider for backward compatibility.
+    pub provider: Option<String>,
     pub version: RealtimeWsVersion,
     #[serde(rename = "type")]
     pub session_type: RealtimeWsMode,
@@ -613,6 +616,9 @@ pub struct RealtimeConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct RealtimeToml {
+    /// Provider from the model_providers map to use for realtime/voice only.
+    /// This does not change the provider used by normal coding turns.
+    pub provider: Option<String>,
     pub version: Option<RealtimeWsVersion>,
     #[serde(rename = "type")]
     pub session_type: Option<RealtimeWsMode>,
