@@ -680,10 +680,9 @@ async fn conversation_start_can_use_realtime_provider_without_switching_task_pro
     });
     let test = builder.build(&api_server).await?;
 
-    let task_provider_base_url = test.codex.config_snapshot().await.model_provider.base_url;
-    assert_eq!(
-        task_provider_base_url.as_deref(),
-        Some(format!("{}/v1", api_server.uri()).as_str())
+    assert_ne!(
+        test.codex.config_snapshot().await.model_provider_id,
+        "voice-only"
     );
 
     test.codex
@@ -781,7 +780,7 @@ async fn conversation_webrtc_uses_realtime_provider_auth_without_switching_task_
     let test = builder.build(&api_server).await?;
 
     assert_eq!(
-        test.codex.config_snapshot().await.model_provider.name,
+        test.codex.config_snapshot().await.model_provider_id,
         "azure-task"
     );
 
