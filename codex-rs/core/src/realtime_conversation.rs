@@ -1284,8 +1284,7 @@ async fn prepare_realtime_start(
     }
     let realtime_call_api_provider =
         if let Some(realtime_call_base_url) = &config.experimental_realtime_webrtc_call_base_url {
-            let mut api_provider =
-                realtime_provider.to_api_provider(Some(AuthMode::ApiKey))?;
+            let mut api_provider = realtime_provider.to_api_provider(Some(AuthMode::ApiKey))?;
             api_provider.base_url = realtime_call_base_url.clone();
             Some(api_provider)
         } else {
@@ -1338,8 +1337,7 @@ async fn prepare_realtime_start(
     let originator = sess.originator().await;
     let mut extra_headers = match transport {
         ConversationStartTransport::Websocket => {
-            let realtime_api_key =
-                realtime_api_key(auth.as_ref(), &realtime_provider)?;
+            let realtime_api_key = realtime_api_key(auth.as_ref(), &realtime_provider)?;
             realtime_request_headers(
                 requested_realtime_session_id.as_deref(),
                 Some(realtime_api_key.as_str()),
