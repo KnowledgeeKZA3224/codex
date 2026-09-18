@@ -136,7 +136,18 @@ pub(crate) struct OutgoingMessageSender {
     /// We keep them here because this is where responses, errors, and
     /// disconnect cleanup all get handled.
     request_contexts: Mutex<HashMap<ConnectionRequestId, RequestContext>>,
+    /// Notifications emitted by a newly-started turn must not outrun the JSON-RPC
+    /// turn/start response that teaches the initiating client which turn it owns.
+    /// Otherwise Desktop can observe a turn event while it is still bound to a
+    /// temporary client-new-thread route and reject the event as an unknown conversation.
+    turn_start_notification_barriers:
+        Mutex<HashMap<(ConnectionId, ThreadId), TurnStartNotificationBarrier>>,
     analytics_events_client: AnalyticsEventsClient,
+}
+
+struct TurnStartNotificationBarrier {
+    pending_response_ids: HashSet<RequestId>,
+    messages: Vec<OutgoingMessage>,
 }
 
 #[derive(Clone)]
@@ -204,7 +215,11 @@ impl ThreadScopedOutgoingMessageSender {
             return;
         }
         self.outgoing
-            .send_server_notification_to_connections(self.connection_ids.as_slice(), notification)
+            .send_thread_server_notification_to_connections(
+                self.thread_id,
+                self.connection_ids.as_slice(),
+                notification,
+            )
             .await;
     }
 
@@ -249,6 +264,7 @@ impl OutgoingMessageSender {
             sender,
             request_id_to_callback: Mutex::new(HashMap::new()),
             request_contexts: Mutex::new(HashMap::new()),
+            turn_start_notification_barriers: Mutex::new(HashMap::new()),
             analytics_events_client,
         }
     }
@@ -277,6 +293,11 @@ impl OutgoingMessageSender {
             .await;
         let mut request_contexts = self.request_contexts.lock().await;
         request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
+        drop(request_contexts);
+        self.turn_start_notification_barriers
+            .lock()
+            .await
+            .retain(|(barrier_connection_id, _), _| *barrier_connection_id != connection_id);
     }
 
     pub(crate) async fn request_trace_context(
@@ -748,6 +769,131 @@ impl OutgoingMessageSender {
         }
         self.send_server_notification_to_connections(&[], notification)
             .await;
+    }
+
+    /// Hold thread-scoped notifications for the initiating connection until its
+    /// turn/start response has been queued. This gives the client a causal handoff:
+    /// response first, then every event produced by that turn.
+    pub(crate) async fn begin_turn_start_notification_barrier(
+        &self,
+        request_id: &ConnectionRequestId,
+        thread_id: ThreadId,
+    ) {
+        let mut barriers = self.turn_start_notification_barriers.lock().await;
+        let barrier = barriers
+            .entry((request_id.connection_id, thread_id))
+            .or_insert_with(|| TurnStartNotificationBarrier {
+                pending_response_ids: HashSet::new(),
+                messages: Vec::new(),
+            });
+        barrier
+            .pending_response_ids
+            .insert(request_id.request_id.clone());
+    }
+
+    /// Release a successful turn/start barrier only after the response itself has
+    /// been enqueued. Deferred notifications are then enqueued to the same
+    /// connection in their original order.
+    pub(crate) async fn release_turn_start_notification_barrier(
+        &self,
+        request_id: &ConnectionRequestId,
+        thread_id: ThreadId,
+    ) {
+        let key = (request_id.connection_id, thread_id);
+        let messages = {
+            let mut barriers = self.turn_start_notification_barriers.lock().await;
+            let Some(barrier) = barriers.get_mut(&key) else {
+                return;
+            };
+            barrier
+                .pending_response_ids
+                .remove(&request_id.request_id);
+            if !barrier.pending_response_ids.is_empty() {
+                return;
+            }
+            barriers
+                .remove(&key)
+                .map(|barrier| barrier.messages)
+                .unwrap_or_default()
+        };
+
+        for message in messages {
+            if let Err(err) = self
+                .sender
+                .send(OutgoingEnvelope::ToConnection {
+                    connection_id: request_id.connection_id,
+                    message,
+                    write_complete_tx: None,
+                })
+                .await
+            {
+                warn!(
+                    "failed to flush deferred turn notification to client: {err:?}"
+                );
+                break;
+            }
+        }
+    }
+
+    /// A failed turn/start never established a valid turn ownership handoff, so
+    /// discard any notifications that raced out of the failed submission.
+    pub(crate) async fn cancel_turn_start_notification_barrier(
+        &self,
+        request_id: &ConnectionRequestId,
+        thread_id: ThreadId,
+    ) {
+        let key = (request_id.connection_id, thread_id);
+        let mut barriers = self.turn_start_notification_barriers.lock().await;
+        let Some(barrier) = barriers.get_mut(&key) else {
+            return;
+        };
+        barrier
+            .pending_response_ids
+            .remove(&request_id.request_id);
+        if barrier.pending_response_ids.is_empty() {
+            barriers.remove(&key);
+        }
+    }
+
+    async fn send_thread_server_notification_to_connections(
+        &self,
+        thread_id: ThreadId,
+        connection_ids: &[ConnectionId],
+        notification: ServerNotification,
+    ) {
+        tracing::trace!(
+            targeted_connections = connection_ids.len(),
+            %thread_id,
+            "app-server thread event: {notification}"
+        );
+        let outgoing_message = timestamped_server_notification(notification);
+
+        for connection_id in connection_ids {
+            let deferred = {
+                let mut barriers = self.turn_start_notification_barriers.lock().await;
+                if let Some(barrier) = barriers.get_mut(&(*connection_id, thread_id)) {
+                    barrier.messages.push(outgoing_message.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+            if deferred {
+                continue;
+            }
+
+            if let Err(err) = self
+                .sender
+                .send(OutgoingEnvelope::ToConnection {
+                    connection_id: *connection_id,
+                    message: outgoing_message.clone(),
+                    write_complete_tx: None,
+                })
+                .await
+            {
+                warn!("failed to send thread server notification to client: {err:?}");
+            }
+        }
     }
 
     pub(crate) async fn send_server_notification_to_connections(
@@ -1267,6 +1413,80 @@ mod tests {
             }
             other => panic!("expected targeted response envelope, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn turn_start_notification_barrier_preserves_response_before_event_order() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let connection_id = ConnectionId(42);
+        let thread_id = ThreadId::new();
+        let request_id = ConnectionRequestId {
+            connection_id,
+            request_id: RequestId::Integer(7),
+        };
+
+        outgoing
+            .begin_turn_start_notification_barrier(&request_id, thread_id)
+            .await;
+
+        let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
+            Arc::clone(&outgoing),
+            vec![connection_id],
+            thread_id,
+        );
+        thread_outgoing
+            .send_server_notification(ServerNotification::Warning(WarningNotification {
+                thread_id: Some(thread_id.to_string()),
+                message: "turn started".to_string(),
+            }))
+            .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "thread notification must wait until turn/start response"
+        );
+
+        outgoing
+            .send_response(
+                request_id.clone(),
+                ClientResponsePayload::ThreadArchive(
+                    codex_app_server_protocol::ThreadArchiveResponse {},
+                ),
+            )
+            .await;
+        outgoing
+            .release_turn_start_notification_barrier(&request_id, thread_id)
+            .await;
+
+        let first = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("response should arrive before timeout")
+            .expect("response envelope should exist");
+        let second = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("notification should arrive before timeout")
+            .expect("notification envelope should exist");
+
+        assert!(matches!(
+            first,
+            OutgoingEnvelope::ToConnection {
+                connection_id: ConnectionId(42),
+                message: OutgoingMessage::Response(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            second,
+            OutgoingEnvelope::ToConnection {
+                connection_id: ConnectionId(42),
+                message: OutgoingMessage::AppServerNotification(_),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
