@@ -805,9 +805,7 @@ impl OutgoingMessageSender {
             let Some(barrier) = barriers.get_mut(&key) else {
                 return;
             };
-            barrier
-                .pending_response_ids
-                .remove(&request_id.request_id);
+            barrier.pending_response_ids.remove(&request_id.request_id);
             if !barrier.pending_response_ids.is_empty() {
                 return;
             }
@@ -827,9 +825,7 @@ impl OutgoingMessageSender {
                 })
                 .await
             {
-                warn!(
-                    "failed to flush deferred turn notification to client: {err:?}"
-                );
+                warn!("failed to flush deferred turn notification to client: {err:?}");
                 break;
             }
         }
