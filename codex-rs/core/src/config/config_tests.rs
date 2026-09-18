@@ -12839,6 +12839,7 @@ voice = "cedar"
     assert_eq!(
         cfg.realtime,
         Some(RealtimeToml {
+            provider: None,
             version: Some(RealtimeWsVersion::V2),
             session_type: Some(RealtimeWsMode::Transcription),
             transport: Some(RealtimeTransport::WebRtc),
@@ -12857,6 +12858,7 @@ voice = "cedar"
     assert_eq!(
         config.realtime,
         RealtimeConfig {
+            provider: None,
             version: RealtimeWsVersion::V2,
             session_type: RealtimeWsMode::Transcription,
             transport: RealtimeTransport::WebRtc,

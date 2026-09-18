@@ -528,6 +528,39 @@ impl ModelClient {
         }
     }
 
+    /// Build a client for a transport-specific provider while preserving the
+    /// task's thread/session context. Realtime voice uses this when its provider
+    /// is intentionally different from the provider executing coding turns.
+    pub(crate) fn clone_with_provider(
+        &self,
+        provider_info: ModelProviderInfo,
+        auth_manager: Option<Arc<AuthManager>>,
+    ) -> Self {
+        let mut client = Self::new(
+            auth_manager,
+            self.agent_identity_policy,
+            self.state.thread_id,
+            provider_info,
+            self.state.session_source.clone(),
+            self.state.originator.clone(),
+            self.state.model_verbosity,
+            self.state.content_item_kinds_enabled,
+            self.state.reasoning_effort_override_enabled,
+            self.state.enable_request_compression,
+            self.state.include_timing_metrics,
+            self.state.beta_features_header.clone(),
+            self.state.concurrent_reasoning_summaries_enabled,
+            self.state.attestation_provider.clone(),
+            self.http_client_factory.clone(),
+            self.state.workspace_routing.clone(),
+        );
+        client.prompt_cache_key_override = self.prompt_cache_key_override.clone();
+        client.codex_responses_headers = self.codex_responses_headers.clone();
+        client.event_sender = self.event_sender.clone();
+        client.restored_history = self.restored_history;
+        client
+    }
+
     pub(crate) fn reasoning_effort_override_enabled(&self) -> bool {
         self.state.reasoning_effort_override_enabled
     }

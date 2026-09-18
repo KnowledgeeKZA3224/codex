@@ -179,14 +179,51 @@ impl TurnRequestProcessor {
         app_server_client_version: Option<String>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         validate_user_input_image_urls(&params.input)?;
-        self.turn_start_inner(
-            request_id,
-            params,
-            app_server_client_name,
-            app_server_client_version,
-        )
-        .await
-        .map(|response| Some(response.into()))
+
+        // A turn can emit TurnStarted immediately after submission. Desktop needs
+        // the turn/start response first so it can replace any temporary
+        // client-new-thread route with the authoritative thread/turn ownership.
+        // Gate thread notifications for this connection until that response is
+        // queued, preventing "unknown conversation" event races.
+        let barrier_thread_id = ThreadId::from_string(&params.thread_id).ok();
+        if let Some(thread_id) = barrier_thread_id {
+            self.outgoing
+                .begin_turn_start_notification_barrier(&request_id, thread_id)
+                .await;
+        }
+
+        let result = self
+            .turn_start_inner(
+                request_id.clone(),
+                params,
+                app_server_client_name,
+                app_server_client_version,
+            )
+            .await;
+
+        match result {
+            Ok(response) => {
+                if let Some(thread_id) = barrier_thread_id {
+                    self.outgoing
+                        .send_response(request_id.clone(), response)
+                        .await;
+                    self.outgoing
+                        .release_turn_start_notification_barrier(&request_id, thread_id)
+                        .await;
+                    Ok(None)
+                } else {
+                    Ok(Some(response.into()))
+                }
+            }
+            Err(error) => {
+                if let Some(thread_id) = barrier_thread_id {
+                    self.outgoing
+                        .cancel_turn_start_notification_barrier(&request_id, thread_id)
+                        .await;
+                }
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn thread_inject_items(

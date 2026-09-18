@@ -3538,6 +3538,10 @@
     "RealtimeToml": {
       "additionalProperties": false,
       "properties": {
+        "provider": {
+          "description": "Provider from the model_providers map to use for realtime/voice only. This does not change the provider used by normal coding turns.",
+          "type": "string"
+        },
         "transport": {
           "$ref": "#/definitions/RealtimeTransport"
         },

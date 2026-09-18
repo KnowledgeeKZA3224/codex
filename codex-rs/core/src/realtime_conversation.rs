@@ -1204,6 +1204,7 @@ pub(crate) async fn handle_start(
 
 struct PreparedRealtimeConversationStart {
     api_provider: ApiProvider,
+    model_client: ModelClient,
     realtime_sideband_base_url: Option<String>,
     extra_headers: Option<HeaderMap>,
     client_managed_handoffs: bool,
@@ -1231,19 +1232,43 @@ async fn prepare_realtime_start(
     sess: &Arc<Session>,
     params: ConversationStartParams,
 ) -> CodexResult<PreparedRealtimeConversationStart> {
-    let provider = sess.provider().await;
-    let auth_manager = sess
-        .services
-        .model_client
-        .auth_manager()
-        .unwrap_or_else(|| Arc::clone(&sess.services.auth_manager));
-    let auth = auth_manager.auth().await;
+    let task_provider = sess.provider().await;
     let config = sess.get_config().await;
+    let separate_realtime_provider = config.realtime.provider.is_some();
+    let realtime_provider = match config.realtime.provider.as_deref() {
+        Some(provider_id) => config
+            .model_providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                CodexErr::InvalidRequest(format!(
+                    "realtime provider '{provider_id}' was not found in model_providers"
+                ))
+            })?,
+        None => task_provider,
+    };
+    let auth_manager = if separate_realtime_provider {
+        Arc::clone(&sess.services.auth_manager)
+    } else {
+        sess.services
+            .model_client
+            .auth_manager()
+            .unwrap_or_else(|| Arc::clone(&sess.services.auth_manager))
+    };
+    let auth = auth_manager.auth().await;
+    let realtime_model_client = if separate_realtime_provider {
+        sess.services.model_client.clone_with_provider(
+            realtime_provider.clone(),
+            Some(Arc::clone(&sess.services.auth_manager)),
+        )
+    } else {
+        sess.services.model_client.clone()
+    };
     let transport = params
         .transport
         .clone()
         .unwrap_or(ConversationStartTransport::Websocket);
-    let mut api_provider = provider.to_api_provider(Some(AuthMode::ApiKey))?;
+    let mut api_provider = realtime_provider.to_api_provider(Some(AuthMode::ApiKey))?;
     let realtime_sideband_base_url = match &transport {
         ConversationStartTransport::ExistingCall {
             sideband_base_url, ..
@@ -1259,7 +1284,7 @@ async fn prepare_realtime_start(
     }
     let realtime_call_api_provider =
         if let Some(realtime_call_base_url) = &config.experimental_realtime_webrtc_call_base_url {
-            let mut api_provider = provider.to_api_provider(Some(AuthMode::ApiKey))?;
+            let mut api_provider = realtime_provider.to_api_provider(Some(AuthMode::ApiKey))?;
             api_provider.base_url = realtime_call_base_url.clone();
             Some(api_provider)
         } else {
@@ -1312,7 +1337,7 @@ async fn prepare_realtime_start(
     let originator = sess.originator().await;
     let mut extra_headers = match transport {
         ConversationStartTransport::Websocket => {
-            let realtime_api_key = realtime_api_key(auth.as_ref(), &provider)?;
+            let realtime_api_key = realtime_api_key(auth.as_ref(), &realtime_provider)?;
             realtime_request_headers(
                 requested_realtime_session_id.as_deref(),
                 Some(realtime_api_key.as_str()),
@@ -1345,6 +1370,7 @@ async fn prepare_realtime_start(
     }
     Ok(PreparedRealtimeConversationStart {
         api_provider,
+        model_client: realtime_model_client,
         realtime_sideband_base_url,
         extra_headers: Some(extra_headers),
         client_managed_handoffs: params.client_managed_handoffs,
@@ -1567,6 +1593,7 @@ async fn handle_start_inner(
 ) -> CodexResult<()> {
     let PreparedRealtimeConversationStart {
         api_provider,
+        model_client,
         realtime_sideband_base_url,
         extra_headers,
         client_managed_handoffs,
@@ -1605,7 +1632,7 @@ async fn handle_start_inner(
         codex_response_handoff_channel_prefixes,
         realtime_call_api_provider,
         session_config,
-        model_client: sess.services.model_client.clone(),
+        model_client,
         sdp,
         existing_call_id,
     };
