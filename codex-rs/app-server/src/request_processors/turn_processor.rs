@@ -204,7 +204,9 @@ impl TurnRequestProcessor {
         match result {
             Ok(response) => {
                 if let Some(thread_id) = barrier_thread_id {
-                    self.outgoing.send_response(request_id.clone(), response).await;
+                    self.outgoing
+                        .send_response(request_id.clone(), response)
+                        .await;
                     self.outgoing
                         .release_turn_start_notification_barrier(&request_id, thread_id)
                         .await;
