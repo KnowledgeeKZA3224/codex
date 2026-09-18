@@ -1066,6 +1066,7 @@ mod tests {
     use codex_app_server_protocol::ServerResponse;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_app_server_protocol::TurnModerationMetadataNotification;
+    use codex_app_server_protocol::WarningNotification;
     use codex_protocol::ThreadId;
     use pretty_assertions::assert_eq;
     use serde_json::json;
