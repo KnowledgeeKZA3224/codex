@@ -847,9 +847,7 @@ impl OutgoingMessageSender {
         let Some(barrier) = barriers.get_mut(&key) else {
             return;
         };
-        barrier
-            .pending_response_ids
-            .remove(&request_id.request_id);
+        barrier.pending_response_ids.remove(&request_id.request_id);
         if barrier.pending_response_ids.is_empty() {
             barriers.remove(&key);
         }
