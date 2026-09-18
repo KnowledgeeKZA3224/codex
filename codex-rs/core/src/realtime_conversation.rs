@@ -1204,6 +1204,7 @@ pub(crate) async fn handle_start(
 
 struct PreparedRealtimeConversationStart {
     api_provider: ApiProvider,
+    model_client: ModelClient,
     realtime_sideband_base_url: Option<String>,
     extra_headers: Option<HeaderMap>,
     client_managed_handoffs: bool,
@@ -1232,13 +1233,8 @@ async fn prepare_realtime_start(
     params: ConversationStartParams,
 ) -> CodexResult<PreparedRealtimeConversationStart> {
     let task_provider = sess.provider().await;
-    let auth_manager = sess
-        .services
-        .model_client
-        .auth_manager()
-        .unwrap_or_else(|| Arc::clone(&sess.services.auth_manager));
-    let auth = auth_manager.auth().await;
     let config = sess.get_config().await;
+    let separate_realtime_provider = config.realtime.provider.is_some();
     let realtime_provider = match config.realtime.provider.as_deref() {
         Some(provider_id) => config
             .model_providers
@@ -1250,6 +1246,23 @@ async fn prepare_realtime_start(
                 ))
             })?,
         None => task_provider,
+    };
+    let auth_manager = if separate_realtime_provider {
+        Arc::clone(&sess.services.auth_manager)
+    } else {
+        sess.services
+            .model_client
+            .auth_manager()
+            .unwrap_or_else(|| Arc::clone(&sess.services.auth_manager))
+    };
+    let auth = auth_manager.auth().await;
+    let realtime_model_client = if separate_realtime_provider {
+        sess.services.model_client.clone_with_provider(
+            realtime_provider.clone(),
+            Some(Arc::clone(&sess.services.auth_manager)),
+        )
+    } else {
+        sess.services.model_client.clone()
     };
     let transport = params
         .transport
@@ -1359,6 +1372,7 @@ async fn prepare_realtime_start(
     }
     Ok(PreparedRealtimeConversationStart {
         api_provider,
+        model_client: realtime_model_client,
         realtime_sideband_base_url,
         extra_headers: Some(extra_headers),
         client_managed_handoffs: params.client_managed_handoffs,
@@ -1581,6 +1595,7 @@ async fn handle_start_inner(
 ) -> CodexResult<()> {
     let PreparedRealtimeConversationStart {
         api_provider,
+        model_client,
         realtime_sideband_base_url,
         extra_headers,
         client_managed_handoffs,
@@ -1619,7 +1634,7 @@ async fn handle_start_inner(
         codex_response_handoff_channel_prefixes,
         realtime_call_api_provider,
         session_config,
-        model_client: sess.services.model_client.clone(),
+        model_client,
         sdp,
         existing_call_id,
     };
