@@ -8,6 +8,7 @@ use crate::endpoint::realtime_websocket::methods_common::websocket_intent;
 use crate::endpoint::realtime_websocket::methods_frameless_bidi::context_append_chunks;
 use crate::endpoint::realtime_websocket::methods_frameless_bidi::delegation_context_append_message as frameless_delegation_context_append_message;
 use crate::endpoint::realtime_websocket::methods_frameless_bidi::session_context_append_message as frameless_session_context_append_message;
+use crate::endpoint::realtime_websocket::methods_frameless_bidi::session_json as frameless_session_json;
 use crate::endpoint::realtime_websocket::protocol::RealtimeAudioFrame;
 use crate::endpoint::realtime_websocket::protocol::RealtimeContextAppendChannel;
 use crate::endpoint::realtime_websocket::protocol::RealtimeEvent;
@@ -21,6 +22,7 @@ use crate::endpoint::realtime_websocket::protocol::RealtimeVoice;
 use crate::endpoint::realtime_websocket::protocol::parse_realtime_event;
 use crate::error::ApiError;
 use crate::provider::Provider;
+use crate::provider::is_azure_responses_provider;
 use codex_client::backoff;
 use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_protocol::protocol::ConversationTextParams;
@@ -32,6 +34,8 @@ use futures::StreamExt;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::StatusCode;
+use serde_json::Value;
+use serde_json::json;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -219,6 +223,7 @@ pub struct RealtimeWebsocketWriter {
     is_closed: Arc<AtomicBool>,
     event_parser: RealtimeEventParser,
     context_append_channel: Option<RealtimeContextAppendChannel>,
+    azure_live: bool,
 }
 
 #[derive(Clone)]
@@ -286,6 +291,7 @@ impl RealtimeWebsocketConnection {
         rx_message: async_channel::Receiver<Result<Message, WsError>>,
         event_parser: RealtimeEventParser,
         transcript_state: RealtimeTranscriptState,
+        azure_live: bool,
     ) -> Self {
         let stream = Arc::new(stream);
         let is_closed = Arc::new(AtomicBool::new(false));
@@ -295,6 +301,7 @@ impl RealtimeWebsocketConnection {
                 is_closed: Arc::clone(&is_closed),
                 event_parser,
                 context_append_channel: None,
+                azure_live,
             },
             events: RealtimeWebsocketEvents {
                 rx_message,
@@ -314,6 +321,11 @@ impl RealtimeWebsocketWriter {
     }
 
     pub async fn send_audio_frame(&self, frame: RealtimeAudioFrame) -> Result<(), ApiError> {
+        if self.azure_live {
+            return self
+                .send_json_value(&azure_live_audio_append_message(frame.data))
+                .await;
+        }
         let message = match self.event_parser {
             RealtimeEventParser::V1 | RealtimeEventParser::RealtimeV2 => {
                 RealtimeOutboundMessage::InputAudioBufferAppend { audio: frame.data }
@@ -386,6 +398,27 @@ impl RealtimeWebsocketWriter {
             .await
     }
 
+    async fn send_azure_live_session_start(
+        &self,
+        config: &RealtimeSessionConfig,
+    ) -> Result<(), ApiError> {
+        self.send_json_value(&azure_live_session_start_message(config)?)
+            .await
+    }
+
+    async fn send_azure_live_initial_items(
+        &self,
+        initial_items: &[ConversationTextParams],
+    ) -> Result<(), ApiError> {
+        for item in initial_items {
+            for chunk in context_append_chunks(&item.text) {
+                self.send_json_value(&azure_live_context_append_message(None, None, chunk))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn send_session_update(
         &self,
         instructions: String,
@@ -437,6 +470,39 @@ impl RealtimeWebsocketWriter {
     }
 
     async fn send_json(&self, message: &RealtimeOutboundMessage) -> Result<(), ApiError> {
+        if self.azure_live {
+            match message {
+                RealtimeOutboundMessage::DelegationContextAppend {
+                    delegation_item_id,
+                    channel,
+                    content,
+                } => {
+                    if let Some(content) = content.first() {
+                        for chunk in context_append_chunks(&content.text) {
+                            self.send_json_value(&azure_live_context_append_message(
+                                Some(delegation_item_id.as_str()),
+                                *channel,
+                                chunk,
+                            ))
+                            .await?;
+                        }
+                        return Ok(());
+                    }
+                }
+                RealtimeOutboundMessage::SessionContextAppend { channel, content } => {
+                    if let Some(content) = content.first() {
+                        for chunk in context_append_chunks(&content.text) {
+                            self.send_json_value(&azure_live_context_append_message(
+                                None, *channel, chunk,
+                            ))
+                            .await?;
+                        }
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
         match message {
             RealtimeOutboundMessage::DelegationContextAppend {
                 delegation_item_id,
@@ -469,6 +535,13 @@ impl RealtimeWebsocketWriter {
             _ => {}
         }
         self.send_json_frame(message).await
+    }
+
+    async fn send_json_value(&self, message: &Value) -> Result<(), ApiError> {
+        let payload = serde_json::to_string(message)
+            .map_err(|err| ApiError::Stream(format!("failed to encode realtime request: {err}")))?;
+        debug!(?message, "realtime websocket request");
+        self.send_payload(payload).await
     }
 
     async fn send_json_frame(&self, message: &RealtimeOutboundMessage) -> Result<(), ApiError> {
@@ -797,12 +870,14 @@ impl RealtimeWebsocketClient {
         extra_headers: HeaderMap,
         default_headers: HeaderMap,
     ) -> Result<RealtimeWebsocketConnection, ApiError> {
+        let azure_live = self.is_azure_live(&config);
         let ws_url = websocket_url_from_api_url(
             self.provider.base_url.as_str(),
             self.provider.query_params.as_ref(),
             config.model.as_deref(),
             config.event_parser,
             config.session_mode,
+            azure_live,
         )?;
         self.connect_realtime_websocket_url(
             ws_url,
@@ -811,8 +886,17 @@ impl RealtimeWebsocketClient {
             default_headers,
             RealtimeSessionInitialization::NewSession,
             RealtimeTranscriptState::default(),
+            azure_live,
         )
         .await
+    }
+
+    fn is_azure_live(&self, config: &RealtimeSessionConfig) -> bool {
+        config.event_parser == RealtimeEventParser::FramelessBidi
+            && is_azure_responses_provider(
+                self.provider.name.as_str(),
+                Some(self.provider.base_url.as_str()),
+            )
     }
 
     pub async fn connect_webrtc_sideband(
@@ -918,6 +1002,7 @@ impl RealtimeWebsocketClient {
             default_headers,
             session_initialization,
             transcript_state,
+            false,
         )
         .await
     }
@@ -945,6 +1030,7 @@ impl RealtimeWebsocketClient {
         default_headers: HeaderMap,
         session_initialization: RealtimeSessionInitialization,
         transcript_state: RealtimeTranscriptState,
+        azure_live: bool,
     ) -> Result<RealtimeWebsocketConnection, ApiError> {
         ensure_rustls_crypto_provider();
 
@@ -996,6 +1082,7 @@ impl RealtimeWebsocketClient {
             rx_message,
             config.event_parser,
             transcript_state,
+            azure_live,
         );
         let initialize_session = match session_initialization {
             RealtimeSessionInitialization::NewSession => true,
@@ -1005,21 +1092,32 @@ impl RealtimeWebsocketClient {
             RealtimeSessionInitialization::ExistingCall => false,
         };
         if initialize_session {
-            debug!(
-                session_id = config.session_id.as_deref().unwrap_or("<none>"),
-                "realtime websocket sending session.update"
-            );
-            connection
-                .writer
-                .send_session_update(
-                    config.instructions,
-                    config.initial_items,
-                    config.session_mode,
-                    config.output_modality,
-                    config.voice,
-                    config.delegation_ack_filler,
-                )
-                .await?;
+            if azure_live {
+                debug!(
+                    session_id = config.session_id.as_deref().unwrap_or("<none>"),
+                    "azure live websocket sending session.start"
+                );
+                connection
+                    .writer
+                    .send_azure_live_session_start(&config)
+                    .await?;
+            } else {
+                debug!(
+                    session_id = config.session_id.as_deref().unwrap_or("<none>"),
+                    "realtime websocket sending session.update"
+                );
+                connection
+                    .writer
+                    .send_session_update(
+                        config.instructions.clone(),
+                        config.initial_items.clone(),
+                        config.session_mode,
+                        config.output_modality,
+                        config.voice,
+                        config.delegation_ack_filler,
+                    )
+                    .await?;
+            }
         }
         if matches!(
             session_initialization,
@@ -1027,9 +1125,56 @@ impl RealtimeWebsocketClient {
         ) && config.event_parser == RealtimeEventParser::FramelessBidi
         {
             connection.events.wait_for_session_started().await?;
+            if azure_live {
+                connection
+                    .writer
+                    .send_azure_live_initial_items(&config.initial_items)
+                    .await?;
+            }
         }
         Ok(connection)
     }
+}
+
+fn azure_live_session_start_message(config: &RealtimeSessionConfig) -> Result<Value, ApiError> {
+    let model = config.model.clone().ok_or_else(|| {
+        ApiError::Stream("Azure GPT-Live requires a model in session.start".to_string())
+    })?;
+    let session = frameless_session_json(
+        Some(model),
+        config.instructions.clone(),
+        Vec::new(),
+        config.voice,
+        None,
+    );
+    Ok(json!({
+        "type": "session.start",
+        "session": session,
+    }))
+}
+
+fn azure_live_audio_append_message(audio: String) -> Value {
+    json!({
+        "type": "session.input_audio.append",
+        "audio": audio,
+    })
+}
+
+fn azure_live_context_append_message(
+    delegation_id: Option<&str>,
+    channel: Option<RealtimeContextAppendChannel>,
+    content: String,
+) -> Value {
+    let event_type = match channel {
+        Some(RealtimeContextAppendChannel::Speakable)
+        | Some(RealtimeContextAppendChannel::Commentary) => "session.commentary.append",
+        None => "session.thinking.append",
+    };
+    json!({
+        "type": event_type,
+        "delegation_id": delegation_id,
+        "content": content,
+    })
 }
 
 fn webrtc_sideband_session_ended(err: &ApiError) -> bool {
@@ -1091,6 +1236,7 @@ fn websocket_url_from_api_url(
     model: Option<&str>,
     event_parser: RealtimeEventParser,
     _session_mode: RealtimeSessionMode,
+    suppress_query: bool,
 ) -> Result<Url, ApiError> {
     let mut url = Url::parse(api_url)
         .map_err(|err| ApiError::Stream(format!("failed to parse realtime api_url: {err}")))?;
@@ -1108,6 +1254,11 @@ fn websocket_url_from_api_url(
                 "unsupported realtime api_url scheme: {scheme}"
             )));
         }
+    }
+
+    if suppress_query {
+        url.set_query(None);
+        return Ok(url);
     }
 
     let intent = websocket_intent(event_parser);
@@ -1150,6 +1301,7 @@ fn websocket_url_from_api_url_for_call(
         /*model*/ None,
         event_parser,
         session_mode,
+        false,
     )?;
     match event_parser {
         RealtimeEventParser::FramelessBidi => {
@@ -1981,6 +2133,7 @@ mod tests {
             /*model*/ None,
             RealtimeEventParser::V1,
             RealtimeSessionMode::Conversational,
+            false,
         )
         .expect("build ws url");
         assert_eq!(
@@ -1997,6 +2150,7 @@ mod tests {
             Some("realtime-test-model"),
             RealtimeEventParser::V1,
             RealtimeSessionMode::Conversational,
+            false,
         )
         .expect("build ws url");
         assert_eq!(
@@ -2013,6 +2167,7 @@ mod tests {
             Some("snapshot"),
             RealtimeEventParser::V1,
             RealtimeSessionMode::Conversational,
+            false,
         )
         .expect("build ws url");
         assert_eq!(
@@ -2029,6 +2184,7 @@ mod tests {
             Some("snapshot"),
             RealtimeEventParser::V1,
             RealtimeSessionMode::Conversational,
+            false,
         )
         .expect("build ws url");
         assert_eq!(
@@ -2048,6 +2204,7 @@ mod tests {
             Some("snapshot"),
             RealtimeEventParser::V1,
             RealtimeSessionMode::Conversational,
+            false,
         )
         .expect("build ws url");
         assert_eq!(
@@ -2064,6 +2221,7 @@ mod tests {
             Some("snapshot"),
             RealtimeEventParser::FramelessBidi,
             RealtimeSessionMode::Conversational,
+            false,
         )
         .expect("build Frameless websocket url");
         assert_eq!(
@@ -2080,6 +2238,7 @@ mod tests {
             /*model*/ None,
             RealtimeEventParser::V1,
             RealtimeSessionMode::Transcription,
+            false,
         )
         .expect("build ws url");
         assert_eq!(
@@ -2099,6 +2258,7 @@ mod tests {
             Some("snapshot"),
             RealtimeEventParser::RealtimeV2,
             RealtimeSessionMode::Conversational,
+            false,
         )
         .expect("build ws url");
         assert_eq!(
@@ -2115,9 +2275,70 @@ mod tests {
             /*model*/ None,
             RealtimeEventParser::RealtimeV2,
             RealtimeSessionMode::Transcription,
+            false,
         )
         .expect("build ws url");
         assert_eq!(url.as_str(), "wss://example.com/v1/realtime");
+    }
+
+    #[test]
+    fn azure_live_websocket_url_suppresses_all_query_parameters() {
+        let url = websocket_url_from_api_url(
+            "wss://resource.openai.azure.com/openai/v1/live/sessions?api-version=preview",
+            Some(&HashMap::from([("trace".to_string(), "1".to_string())])),
+            Some("gpt-live-1"),
+            RealtimeEventParser::FramelessBidi,
+            RealtimeSessionMode::Conversational,
+            true,
+        )
+        .expect("build Azure Live websocket url");
+        assert_eq!(
+            url.as_str(),
+            "wss://resource.openai.azure.com/openai/v1/live/sessions"
+        );
+    }
+
+    #[test]
+    fn azure_live_start_places_model_inside_session_start() {
+        let message = azure_live_session_start_message(&RealtimeSessionConfig {
+            instructions: "Be concise.".to_string(),
+            initial_items: Vec::new(),
+            delegation_ack_filler: None,
+            model: Some("gpt-live-1".to_string()),
+            session_id: None,
+            event_parser: RealtimeEventParser::FramelessBidi,
+            session_mode: RealtimeSessionMode::Conversational,
+            output_modality: RealtimeOutputModality::Audio,
+            voice: RealtimeVoice::Marin,
+        })
+        .expect("build Azure Live session.start");
+
+        assert_eq!(message["type"], "session.start");
+        assert_eq!(message["session"]["model"], "gpt-live-1");
+        assert_eq!(message["session"]["delegation"]["type"], "client");
+        assert!(message["session"].get("initial_items").is_none());
+    }
+
+    #[test]
+    fn azure_live_maps_audio_and_context_event_names() {
+        assert_eq!(
+            azure_live_audio_append_message("AAAA".to_string())["type"],
+            "session.input_audio.append"
+        );
+
+        let quiet = azure_live_context_append_message(None, None, "context".to_string());
+        assert_eq!(quiet["type"], "session.thinking.append");
+        assert!(quiet["delegation_id"].is_null());
+        assert_eq!(quiet["content"], "context");
+
+        let spoken = azure_live_context_append_message(
+            Some("item_123"),
+            Some(RealtimeContextAppendChannel::Commentary),
+            "answer".to_string(),
+        );
+        assert_eq!(spoken["type"], "session.commentary.append");
+        assert_eq!(spoken["delegation_id"], "item_123");
+        assert_eq!(spoken["content"], "answer");
     }
 
     #[test]
