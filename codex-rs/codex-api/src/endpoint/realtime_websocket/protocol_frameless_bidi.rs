@@ -17,14 +17,22 @@ pub(super) fn parse_frameless_bidi_event(payload: &str) -> Option<RealtimeEvent>
     match message_type.as_str() {
         "session.started" | "session.updated" => parse_session_updated_event(&parsed),
         "output_audio.delta" => parse_output_audio_delta(&parsed),
+        "session.output_audio.delta" => parse_azure_output_audio_delta(&parsed),
         "input_transcript.added" => {
             parse_transcript_item(&parsed).map(RealtimeEvent::InputTranscriptDelta)
+        }
+        "session.input_transcript.delta" => {
+            parse_delta_transcript(&parsed).map(RealtimeEvent::InputTranscriptDelta)
         }
         "output_transcript.added" => {
             parse_transcript_item(&parsed).map(RealtimeEvent::OutputTranscriptDelta)
         }
+        "session.output_transcript.delta" => {
+            parse_delta_transcript(&parsed).map(RealtimeEvent::OutputTranscriptDelta)
+        }
         "turn.done" => parse_turn_done(&parsed),
         "delegation.created" => parse_delegation_created(&parsed),
+        "session.delegation.created" => parse_azure_delegation_created(&parsed),
         "error" => parse_error_event(&parsed),
         _ => {
             debug!(
@@ -43,6 +51,24 @@ fn parse_output_audio_delta(parsed: &Value) -> Option<RealtimeEvent> {
         samples_per_channel: None,
         item_id: None,
     }))
+}
+
+fn parse_azure_output_audio_delta(parsed: &Value) -> Option<RealtimeEvent> {
+    Some(RealtimeEvent::AudioOut(RealtimeAudioFrame {
+        data: parsed.get("delta").and_then(Value::as_str)?.to_string(),
+        sample_rate: DEFAULT_AUDIO_SAMPLE_RATE,
+        num_channels: DEFAULT_AUDIO_CHANNELS,
+        samples_per_channel: None,
+        item_id: None,
+    }))
+}
+
+fn parse_delta_transcript(parsed: &Value) -> Option<RealtimeTranscriptDelta> {
+    parsed
+        .get("delta")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .map(|delta| RealtimeTranscriptDelta { delta })
 }
 
 fn parse_transcript_item(parsed: &Value) -> Option<RealtimeTranscriptDelta> {
@@ -68,6 +94,22 @@ fn parse_turn_done(parsed: &Value) -> Option<RealtimeEvent> {
         "assistant" => Some(RealtimeEvent::OutputTranscriptDone(done)),
         _ => None,
     }
+}
+
+fn parse_azure_delegation_created(parsed: &Value) -> Option<RealtimeEvent> {
+    let delegation = parsed.get("delegation")?.as_object()?;
+    if delegation.get("type").and_then(Value::as_str) != Some("delegation")
+        || delegation.get("target").and_then(Value::as_str) != Some("client")
+    {
+        return None;
+    }
+    let item_id = delegation.get("id").and_then(Value::as_str)?.to_string();
+    Some(RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
+        handoff_id: item_id.clone(),
+        item_id,
+        input_transcript: String::new(),
+        active_transcript: Vec::new(),
+    }))
 }
 
 fn parse_delegation_created(parsed: &Value) -> Option<RealtimeEvent> {
