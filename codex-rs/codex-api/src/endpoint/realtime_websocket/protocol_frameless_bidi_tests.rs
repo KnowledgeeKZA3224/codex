@@ -62,3 +62,51 @@ fn frameless_transcript_and_audio_events_reuse_existing_internal_events() {
         Some(RealtimeEvent::AudioOut(_))
     ));
 }
+
+#[test]
+fn azure_live_transcript_audio_and_delegation_events_map_to_internal_events() {
+    let input = r#"{
+        "type": "session.input_transcript.delta",
+        "delta": "hello"
+    }"#;
+    let output = r#"{
+        "type": "session.output_transcript.delta",
+        "delta": "hi"
+    }"#;
+    let audio = r#"{
+        "type": "session.output_audio.delta",
+        "delta": "AAE=",
+        "start_ms": 0,
+        "end_ms": 100
+    }"#;
+    let delegation = r#"{
+        "type": "session.delegation.created",
+        "delegation": {
+            "id": "item_delegation_123",
+            "type": "delegation",
+            "target": "client"
+        }
+    }"#;
+
+    assert!(matches!(
+        parse_frameless_bidi_event(input),
+        Some(RealtimeEvent::InputTranscriptDelta(_))
+    ));
+    assert!(matches!(
+        parse_frameless_bidi_event(output),
+        Some(RealtimeEvent::OutputTranscriptDelta(_))
+    ));
+    assert!(matches!(
+        parse_frameless_bidi_event(audio),
+        Some(RealtimeEvent::AudioOut(_))
+    ));
+    assert_eq!(
+        parse_frameless_bidi_event(delegation),
+        Some(RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
+            handoff_id: "item_delegation_123".to_string(),
+            item_id: "item_delegation_123".to_string(),
+            input_transcript: String::new(),
+            active_transcript: Vec::new(),
+        }))
+    );
+}
