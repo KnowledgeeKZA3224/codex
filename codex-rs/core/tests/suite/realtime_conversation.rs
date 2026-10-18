@@ -659,6 +659,191 @@ async fn conversation_start_defaults_to_v2_and_gpt_realtime_1_5() -> Result<()> 
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conversation_start_can_use_realtime_provider_without_switching_task_provider() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let api_server = start_mock_server().await;
+    let realtime_server = start_websocket_server(vec![vec![vec![]]]).await;
+    let realtime_base_url = realtime_server.uri().to_string();
+    let mut builder = test_codex().with_config(move |config| {
+        let mut realtime_provider = config.model_provider.clone();
+        realtime_provider.name = "voice-only".to_string();
+        realtime_provider.base_url = Some(realtime_base_url);
+        realtime_provider.supports_websockets = true;
+        config
+            .model_providers
+            .insert("voice-only".to_string(), realtime_provider);
+        config.realtime.provider = Some("voice-only".to_string());
+        config.experimental_realtime_ws_startup_context = Some(String::new());
+    });
+    let test = builder.build(&api_server).await?;
+
+    assert_ne!(
+        test.codex.config_snapshot().await.model_provider_id,
+        "voice-only"
+    );
+
+    test.codex
+        .submit(Op::RealtimeConversationStart(ConversationStartParams {
+            client_managed_handoffs: false,
+            delegation_ack_filler: None,
+            flush_transcript_tail_on_session_end: false,
+            codex_responses_as_items: false,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode:
+                codex_protocol::protocol::CodexResponseHandoffMode::Thinking,
+            codex_response_handoff_channel_prefixes: None,
+            model: None,
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: true,
+            initial_items: Vec::new(),
+            realtime_start_instructions: None,
+            realtime_end_instructions: None,
+            prompt: Some(Some("backend prompt".to_string())),
+            realtime_session_id: None,
+            transport: None,
+            version: None,
+            voice: None,
+        }))
+        .await?;
+
+    let _ = wait_for_event_match(&test.codex, |msg| match msg {
+        EventMsg::RealtimeConversationStarted(started) => Some(Ok(started.clone())),
+        EventMsg::Error(err) => Some(Err(err.clone())),
+        _ => None,
+    })
+    .await
+    .expect("conversation start failed");
+
+    assert!(
+        realtime_server
+            .wait_for_handshakes(/*expected*/ 1, Duration::from_secs(2))
+            .await
+    );
+    let handshake = realtime_server.single_handshake();
+    assert_eq!(handshake.uri(), "/v1/realtime?model=gpt-realtime-1.5");
+    assert_eq!(
+        handshake.header("authorization").as_deref(),
+        Some("Bearer dummy")
+    );
+
+    realtime_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conversation_webrtc_uses_realtime_provider_auth_without_switching_task_provider()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let api_server = start_mock_server().await;
+    let call_capture = RealtimeCallRequestCapture::new();
+    Mock::given(method("POST"))
+        .and(path_regex(".*/backend-api/codex/realtime/calls$"))
+        .and(call_capture.clone())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Location", "/v1/live/rtc_voice_provider")
+                .set_body_string("v=answer\r\n"),
+        )
+        .mount(&api_server)
+        .await;
+    let realtime_server = start_websocket_server(vec![vec![vec![json!({
+        "type": "session.started",
+        "session": { "id": "rtc_voice_provider", "instructions": "backend prompt" }
+    })]]])
+    .await;
+
+    let voice_base_url = format!("{}/backend-api/codex", api_server.uri());
+    let realtime_ws_base_url = realtime_server.uri().to_string();
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            let mut voice_provider = config.model_provider.clone();
+            voice_provider.name = "voice-openai".to_string();
+            voice_provider.base_url = Some(voice_base_url);
+            voice_provider.requires_openai_auth = true;
+            config
+                .model_providers
+                .insert("voice-openai".to_string(), voice_provider);
+            config.realtime.provider = Some("voice-openai".to_string());
+            config.experimental_realtime_ws_base_url = Some(realtime_ws_base_url);
+            config.experimental_realtime_ws_backend_prompt = Some("backend prompt".to_string());
+
+            config.model_provider.name = "azure-task".to_string();
+            config.model_provider.base_url = Some("https://azure-task.invalid".to_string());
+            config.model_provider.requires_openai_auth = false;
+            config.model_provider_id = "azure-task".to_string();
+        });
+    let test = builder.build(&api_server).await?;
+
+    assert_eq!(
+        test.codex.config_snapshot().await.model_provider_id,
+        "azure-task"
+    );
+
+    test.codex
+        .submit(Op::RealtimeConversationStart(ConversationStartParams {
+            client_managed_handoffs: false,
+            delegation_ack_filler: None,
+            flush_transcript_tail_on_session_end: false,
+            codex_responses_as_items: false,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode:
+                codex_protocol::protocol::CodexResponseHandoffMode::Thinking,
+            codex_response_handoff_channel_prefixes: None,
+            model: None,
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: false,
+            initial_items: Vec::new(),
+            realtime_start_instructions: None,
+            realtime_end_instructions: None,
+            prompt: Some(Some("backend prompt".to_string())),
+            realtime_session_id: None,
+            transport: Some(ConversationStartTransport::Webrtc {
+                sdp: "v=offer\r\n".to_string(),
+            }),
+            version: Some(RealtimeConversationVersion::V3),
+            voice: None,
+        }))
+        .await?;
+
+    let created = wait_for_event_match(&test.codex, |msg| match msg {
+        EventMsg::RealtimeConversationSdp(created) => Some(Ok(created.clone())),
+        EventMsg::Error(err) => Some(Err(err.clone())),
+        _ => None,
+    })
+    .await
+    .expect("conversation call create failed");
+    assert_eq!(created.sdp, "v=answer\r\n");
+
+    let request = call_capture.single_request();
+    assert_eq!(
+        request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer Access Token")
+    );
+
+    assert!(
+        realtime_server
+            .wait_for_handshakes(/*expected*/ 1, Duration::from_secs(2))
+            .await
+    );
+    let handshake = realtime_server.single_handshake();
+    assert_eq!(
+        handshake.header("authorization").as_deref(),
+        Some("Bearer Access Token")
+    );
+
+    test.codex.submit(Op::RealtimeConversationClose).await?;
+    realtime_server.shutdown().await;
+    Ok(())
+}
+
 #[test_matrix(
     [ConversationStartTransport::Websocket, ConversationStartTransport::ExistingCall { call_id: "rtc_existing".to_string(), sideband_base_url: None }],
     [None, Some(ThreadSource::User)]
